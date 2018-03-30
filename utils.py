@@ -16,8 +16,10 @@ import tensorflow as tf
 import scipy.misc
 import skimage.color
 import skimage.io
+import skimage.transform
 import urllib.request
 import shutil
+import warnings
 
 # URL from which to download the latest COCO trained weights
 COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
@@ -360,6 +362,9 @@ class Dataset(object):
         # If grayscale. Convert to RGB for consistency.
         if image.ndim != 3:
             image = skimage.color.gray2rgb(image)
+        # If has an alpha channel, remove it for consistency
+        if image.shape[-1] == 4:
+            image = image[..., :3]
         return image
 
     def load_mask(self, image_id):
@@ -441,8 +446,11 @@ def resize_mask(mask, scale, padding):
     padding: Padding to add to the mask in the form
             [(top, bottom), (left, right), (0, 0)]
     """
-    h, w = mask.shape[:2]
-    mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)
+    # Suppress warning from scipy 0.13.0, the output shape of zoom() is
+    # calculated with round() instead of int()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mask = scipy.ndimage.zoom(mask, zoom=[scale, scale, 1], order=0)
     mask = np.pad(mask, padding, mode='constant', constant_values=0)
     return mask
 
@@ -460,8 +468,8 @@ def minimize_mask(bbox, mask, mini_shape):
         m = m[y1:y2, x1:x2]
         if m.size == 0:
             raise Exception("Invalid bounding box with area of zero")
-        m = scipy.misc.imresize(m.astype(float), mini_shape, interp='bilinear')
-        mini_mask[:, :, i] = np.where(m >= 128, 1, 0)
+        m = skimage.transform.resize(m, mini_shape, order=1, mode="reflect")
+        mini_mask[:, :, i] = np.around(m).astype(np.bool)
     return mini_mask
 
 
@@ -477,8 +485,8 @@ def expand_mask(bbox, mini_mask, image_shape):
         y1, x1, y2, x2 = bbox[i][:4]
         h = y2 - y1
         w = x2 - x1
-        m = scipy.misc.imresize(m.astype(float), (h, w), interp='bilinear')
-        mask[y1:y2, x1:x2, i] = np.where(m >= 128, 1, 0)
+        m = skimage.transform.resize(m, (h, w), order=1, mode="reflect")
+        mask[y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
     return mask
 
 
@@ -497,8 +505,8 @@ def unmold_mask(mask, bbox, image_shape):
     """
     threshold = 0.5
     y1, x1, y2, x2 = bbox
-    mask = scipy.misc.imresize(
-        mask, (y2 - y1, x2 - x1), interp='bilinear').astype(np.float32) / 255.0
+    mask = skimage.transform.resize(mask, (y2 - y1, x2 - x1),
+                                    order=1, mode="reflect")
     mask = np.where(mask >= threshold, 1, 0).astype(np.uint8)
 
     # Put the mask in the right location.
@@ -610,7 +618,7 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
     # Compute IoU overlaps [pred_masks, gt_masks]
     overlaps = compute_overlaps_masks(pred_masks, gt_masks)
 
-    # Loop through ground truth boxes and find matching predictions
+    # Loop through predictions and find matching ground truth boxes
     match_count = 0
     pred_match = np.zeros([pred_boxes.shape[0]])
     gt_match = np.zeros([gt_boxes.shape[0]])
